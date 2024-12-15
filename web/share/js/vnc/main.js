@@ -38,6 +38,7 @@ function __loadKvmdInfo() {
 				<span class="code-comment"># How to connect using the Linux terminal:<br>
 				$</span> vncviewer ${window.location.hostname}::${vnc_port}
 			`;
+			$("vnc-link").href = `https://${window.location.hostname}/share/noVNC/vnc.html?autoconnect=true&reconnect=reconnect&host=${window.location.hostname}&encrypt=${tools.is_https}&path=vncws&shared=true&resize=scale`
 		} else if (http.status === 401 || http.status === 403) {
 			document.location.href = "/login";
 		} else {

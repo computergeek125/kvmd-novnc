@@ -191,6 +191,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             _Subsystem.make(info_manager, "Info manager", self.__EV_INFO_STATE),
         ]
 
+        self.__info_manager = info_manager
         self.__streamer_notifier = aiotools.AioNotifier()
         self.__reset_streamer = False
         self.__new_streamer_params: dict = {}
@@ -248,6 +249,14 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
     @exposed_ws("ping")
     async def __ws_ping_handler(self, ws: WsSession, _: dict) -> None:
         await ws.send_event("pong", {})
+        
+    @exposed_http("GET", "/vncws")
+    async def __vncws_handler(self, req: Request) -> WebSocketResponse:
+        extras_info = await self.__info_manager.get_state(["extras"])
+        vnc_info = extras_info["extras"]["vnc"]
+        if vnc_info["started"]:
+            async with self._vncws_session(req, stream=True, legacy=False, vnc_port=vnc_info["port"]) as ws:
+                return (await self._vncws_loop(ws))
 
     # ===== SYSTEM STUFF
 

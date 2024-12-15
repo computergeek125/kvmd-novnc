@@ -22,6 +22,7 @@
 
 import os
 import socket
+import select
 import asyncio
 import contextlib
 import dataclasses
@@ -34,6 +35,7 @@ from typing import AsyncGenerator
 from typing import Any
 
 from aiohttp import ClientWebSocketResponse
+from aiohttp import WSCloseCode
 from aiohttp.web import BaseRequest
 from aiohttp.web import Request
 from aiohttp.web import Response
@@ -384,6 +386,69 @@ class HttpServer:
                 break
         return ws.wsr
 
+    @contextlib.asynccontextmanager
+    async def _vncws_session(self, req: Request, **kwargs: Any) -> AsyncGenerator[WsSession, None]:
+        assert self.__ws_heartbeat is not None
+        wsr = WebSocketResponse(heartbeat=self.__ws_heartbeat)
+        await wsr.prepare(req)
+        ws = WsSession(wsr, kwargs)
+
+        async with self.__ws_sessions_lock:
+            self.__ws_sessions.append(ws)
+            get_logger(2).info("Registered new client session: %s; clients now: %d", ws, len(self.__ws_sessions))
+
+        try:
+            assert isinstance(kwargs["vnc_port"], int)
+            vnc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            vnc_socket.connect(("localhost", kwargs["vnc_port"]))
+            vnc_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            #vnc_socket.setblocking(0)
+            ws.kwargs["vnc_socket"] = vnc_socket
+            yield ws
+        finally:
+            await aiotools.shield_fg(self.__close_ws(ws))
+
+    async def _vncws_loop(self, ws: WsSession) -> WebSocketResponse:
+        logger = get_logger()
+        vnc_socket = ws.kwargs["vnc_socket"]
+        running_flag = asyncio.Event()
+        running_flag.set()
+        logger.info("VNCWS: Starting loops")
+        while running_flag.is_set():
+            rlist_wait = [vnc_socket]
+            wlist_wait = []
+            xlist_wait = []
+            rlist, wlist, xlist = select.select(rlist_wait, wlist_wait, xlist_wait, 0.0001)
+            for rs in rlist:
+                assert isinstance(rs, socket.socket)
+                buf = rs.recv(65535, socket.MSG_DONTWAIT)
+                if len(buf) == 0:
+                    logger.info("VNCWS: VNC server closed socket")
+                    running_flag.clear()
+                    break
+                await ws.wsr.send_bytes(buf)
+            try:
+                msg = await ws.wsr.receive(timeout=0.0001)
+                logger.debug("VNCWS: Received ws messaeg %r", msg)
+                if msg.type == WSMsgType.TEXT:
+                    logger.error("VNCWS: Unknown websocket text event: %s %r", msg.type, msg.data)
+                elif msg.type == WSMsgType.BINARY and len(msg.data) >= 1:
+                    vnc_socket.send(msg.data)
+                elif msg.type == WSMsgType.CLOSE:
+                    ws_close_code = WSCloseCode(msg.data)
+                    logger.info("VNCWS: WebSocket closed with code %s", ws_close_code.name)
+                    running_flag.clear()
+                    break
+                else:
+                    logger.error("VNCWS: Unknown websocket event, killing socket: %s %r", msg.type, msg.data)
+                    running_flag.clear()
+                    break
+            except TimeoutError:
+                pass
+            except Exception:
+                logger.exception("VNCWS: An unknown exception occurred in the WS event loop")
+        return ws.wsr
+
     async def _broadcast_ws_event(self, event_type: str, event: (dict | None), legacy: (bool | None)=None) -> None:
         if self.__ws_sessions:
             await asyncio.gather(*[
@@ -410,8 +475,12 @@ class HttpServer:
         async with self.__ws_sessions_lock:
             try:
                 self.__ws_sessions.remove(ws)
-                get_logger(3).info("Removed client socket: %s; clients now: %d", ws, len(self.__ws_sessions))
+                logger = get_logger(3)
+                logger.info("Removed client socket: %s; clients now: %d", ws, len(self.__ws_sessions))
                 await ws.wsr.close()
+                if "vnc_socket" in ws.kwargs:
+                    logger.info("Closing VNC socket from client %s (%s)", ws, ws.kwargs["vnc_port"])
+                    ws.kwargs["vnc_sock"].close()
             except Exception:
                 pass
         await self._on_ws_closed()
